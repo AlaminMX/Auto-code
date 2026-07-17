@@ -1,21 +1,22 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenAI, FunctionCallingConfigMode } from "@google/genai";
+import type { Content, FunctionDeclaration, Part } from "@google/genai";
 import { getFileContent, listRepoTree } from "./github";
 import type { GeneratePlan, ProposedFileChange } from "./types";
 
-const MODEL = "claude-sonnet-5";
-const MAX_TURNS = 14; // hard cap so a confused agent can't loop forever / burn tokens
+const MODEL = "gemini-2.5-flash"; // free tier: 1,500 req/day, 1M token context
+const MAX_TURNS = 14; // hard cap so a confused agent can't loop forever / burn quota
 
-const TOOLS: Anthropic.Tool[] = [
+const FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
   {
     name: "list_files",
     description:
       "List every file path in the repository at the working branch. Call this first to see the project layout.",
-    input_schema: { type: "object", properties: {}, required: [] },
+    parametersJsonSchema: { type: "object", properties: {}, required: [] },
   },
   {
     name: "read_file",
     description: "Read the full text content of one file in the repository.",
-    input_schema: {
+    parametersJsonSchema: {
       type: "object",
       properties: {
         path: { type: "string", description: "Repo-relative file path, e.g. src/app.ts" },
@@ -27,7 +28,7 @@ const TOOLS: Anthropic.Tool[] = [
     name: "propose_changes",
     description:
       "Submit your final, complete set of file changes. Call this exactly once, only after you've read every file you needed to. Do not guess at content you haven't read — read a file before editing it.",
-    input_schema: {
+    parametersJsonSchema: {
       type: "object",
       properties: {
         summary: {
@@ -61,18 +62,18 @@ const TOOLS: Anthropic.Tool[] = [
 ];
 
 export async function runAgentLoop(params: {
-  anthropicApiKey: string;
+  geminiApiKey: string;
   githubToken: string;
   owner: string;
   repo: string;
   baseBranch: string;
   prompt: string;
 }): Promise<GeneratePlan> {
-  const { anthropicApiKey, githubToken, owner, repo, baseBranch, prompt } = params;
-  const anthropic = new Anthropic({ apiKey: anthropicApiKey });
+  const { geminiApiKey, githubToken, owner, repo, baseBranch, prompt } = params;
+  const ai = new GoogleGenAI({ apiKey: geminiApiKey });
   const notes: string[] = [];
 
-  const system = `You are a careful senior engineer making a code change to the repository ${owner}/${repo} on branch ${baseBranch}.
+  const systemInstruction = `You are a careful senior engineer making a code change to the repository ${owner}/${repo} on branch ${baseBranch}.
 Explore only what you need with list_files and read_file, then call propose_changes exactly once with a complete, correct, minimal diff.
 Rules:
 - Never invent file content you haven't read. Read a file before modifying it.
@@ -81,42 +82,39 @@ Rules:
 - If the request is ambiguous or you're missing critical context, make the most reasonable assumption, state it in "summary", and proceed — don't leave the task incomplete.
 - Do not touch files unrelated to the request.`;
 
-  const messages: Anthropic.MessageParam[] = [
-    { role: "user", content: `Task: ${prompt}` },
-  ];
+  const contents: Content[] = [{ role: "user", parts: [{ text: `Task: ${prompt}` }] }];
 
   // Cache original file contents so we can build an accurate diff (old vs new) at the end.
   const originalContents = new Map<string, string | null>();
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
-    const response = await anthropic.messages.create({
+    const response = await ai.models.generateContent({
       model: MODEL,
-      max_tokens: 8000,
-      system,
-      tools: TOOLS,
-      messages,
+      contents,
+      config: {
+        systemInstruction,
+        tools: [{ functionDeclarations: FUNCTION_DECLARATIONS }],
+        toolConfig: { functionCallingConfig: { mode: FunctionCallingConfigMode.AUTO } },
+      },
     });
 
-    messages.push({ role: "assistant", content: response.content });
+    const candidateContent = response.candidates?.[0]?.content;
+    if (!candidateContent) {
+      throw new Error("Gemini returned no content — check your API key and quota.");
+    }
+    contents.push(candidateContent);
 
-    const toolUses = response.content.filter(
-      (block): block is Anthropic.ToolUseBlock => block.type === "tool_use"
-    );
+    const functionCalls = response.functionCalls ?? [];
 
-    if (toolUses.length === 0) {
-      // Model stopped without proposing changes — surface what it said as an error upstream.
-      const text = response.content
-        .filter((b): b is Anthropic.TextBlock => b.type === "text")
-        .map((b) => b.text)
-        .join("\n");
+    if (functionCalls.length === 0) {
       throw new Error(
-        `Agent stopped without proposing a change. Last message: ${text || "(empty)"}`
+        `Agent stopped without proposing a change. Last message: ${response.text || "(empty)"}`
       );
     }
 
-    const proposeCall = toolUses.find((t) => t.name === "propose_changes");
+    const proposeCall = functionCalls.find((fc) => fc.name === "propose_changes");
     if (proposeCall) {
-      const input = proposeCall.input as {
+      const input = proposeCall.args as unknown as {
         summary: string;
         branch_name: string;
         files: { path: string; action: "create" | "modify" | "delete"; content?: string }[];
@@ -136,30 +134,34 @@ Rules:
       };
     }
 
-    // Execute every other tool call and feed results back in one user turn.
-    const toolResults: Anthropic.ToolResultBlockParam[] = [];
-    for (const call of toolUses) {
+    // Execute every other call and feed results back in one turn.
+    const responseParts: Part[] = [];
+    for (const call of functionCalls) {
       if (call.name === "list_files") {
         const paths = await listRepoTree(githubToken, owner, repo, baseBranch);
         notes.push(`Listed ${paths.length} files in the repo.`);
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: call.id,
-          content: paths.join("\n").slice(0, 50000),
+        responseParts.push({
+          functionResponse: {
+            name: call.name,
+            id: call.id,
+            response: { result: paths.join("\n").slice(0, 50000) },
+          },
         });
       } else if (call.name === "read_file") {
-        const { path } = call.input as { path: string };
+        const { path } = call.args as unknown as { path: string };
         const content = await getFileContent(githubToken, owner, repo, path, baseBranch);
         originalContents.set(path, content);
         notes.push(`Read ${path} (${content === null ? "not found" : `${content.length} chars`}).`);
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: call.id,
-          content: content === null ? `File not found: ${path}` : content,
+        responseParts.push({
+          functionResponse: {
+            name: call.name,
+            id: call.id,
+            response: { result: content === null ? `File not found: ${path}` : content },
+          },
         });
       }
     }
-    messages.push({ role: "user", content: toolResults });
+    contents.push({ role: "user", parts: responseParts });
   }
 
   throw new Error("Agent exceeded the maximum number of exploration turns without proposing a change.");
