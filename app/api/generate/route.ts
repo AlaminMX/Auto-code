@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { GH_PAT_COOKIE } from "@/lib/types";
-import { runAgentLoop } from "@/lib/claude";
+import { runAgentLoop } from "@/lib/agent";
 
 export async function POST(req: NextRequest) {
   const token = req.cookies.get(GH_PAT_COOKIE)?.value;
@@ -8,10 +8,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Not connected to GitHub" }, { status: 401 });
   }
 
-  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
-  if (!anthropicApiKey) {
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  if (!geminiApiKey) {
     return NextResponse.json(
-      { error: "Server is missing ANTHROPIC_API_KEY. Set it in your deployment's env vars." },
+      { error: "Server is missing GEMINI_API_KEY. Set it in your deployment's env vars." },
       { status: 500 }
     );
   }
@@ -31,7 +31,7 @@ export async function POST(req: NextRequest) {
 
   try {
     const plan = await runAgentLoop({
-      anthropicApiKey,
+      geminiApiKey,
       githubToken: token,
       owner,
       repo,
